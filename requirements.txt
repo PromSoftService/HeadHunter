@@ -1,0 +1,1 @@
+requests tqdm pandas openpyxl tabulate playwright beautifulsoup4
