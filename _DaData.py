@@ -8,10 +8,20 @@
 import sys
 import requests
 import re
+import os
+import sys
+from dotenv import load_dotenv
 
-# 🔑 ВСТАВЬТЕ СВОИ КЛЮЧИ СЮДА
-API_KEY = "1f89f6298e5e8fc98500954a2a73498a58d39a24"  # Замените на свой
-SECRET_KEY = "4cf476bf5820e46c89424e9fe534cc5f440f2b72"  # Замените на свой
+# Загружаем переменные из .env
+load_dotenv()
+
+# 🔑 КЛЮЧИ DADATA из .env
+API_KEY = os.getenv("DADATA_API_KEY", "")
+SECRET_KEY = os.getenv("DADATA_SECRET_KEY", "")
+
+if not API_KEY or not SECRET_KEY:
+    print("⚠️  Предупреждение: DADATA_API_KEY или DADATA_SECRET_KEY не найдены в .env")
+    sys.exit(1)
 
 def check_phone_dadata(phone: str):
     """Проверка через DaData"""

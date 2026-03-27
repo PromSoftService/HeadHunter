@@ -1,2 +1,5 @@
-site_archive
-employers.db
+.env
+*.db
+site_archive/
+training_results_*.json
+__pycache__/

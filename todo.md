@@ -277,7 +277,7 @@ py -3.14 site_mirror.py --db employers.db --base-dir site_archive --max-pages 12
 py -3.14 extract_contacts.py --db employers.db --archive-dir site_archive
 
 # 4. Категоризация компаний (обучение)
-py -3.14 categorize_companies.py --db employers.db --train --sample 100
+py -3.14 categorize_companies.py --db employers.db --train --sample 1000
 
 # 5. Категоризация всех компаний
 py -3.14 categorize_companies.py --db employers.db --all

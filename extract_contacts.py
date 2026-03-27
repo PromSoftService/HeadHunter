@@ -37,12 +37,21 @@ import requests
 import time
 from tqdm import tqdm
 from bs4 import BeautifulSoup
+import os
+import sys
+from dotenv import load_dotenv
 
-# ============================================================
-# 🔑 НАСТРОЙКИ DADATA - ВСТАВЬТЕ СВОИ КЛЮЧИ
-# ============================================================
-DADATA_API_KEY = "1f89f6298e5e8fc98500954a2a73498a58d39a24"
-DADATA_SECRET_KEY = "4cf476bf5820e46c89424e9fe534cc5f440f2b72"
+# Загружаем переменные из .env
+load_dotenv()
+
+# 🔑 НАСТРОЙКИ DADATA из .env
+DADATA_API_KEY = os.getenv("DADATA_API_KEY", "")
+DADATA_SECRET_KEY = os.getenv("DADATA_SECRET_KEY", "")
+
+if not DADATA_API_KEY or not DADATA_SECRET_KEY:
+    print("\n⚠️  DaData не настроен - телефоны будут сохраняться без проверки")
+    print("   Получите ключи на dadata.ru и добавьте их в файл .env\n")
+    sys.exit(1)
 
 # Разделитель для множественных контактов
 SEP = "; "
