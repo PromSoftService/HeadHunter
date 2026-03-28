@@ -89,7 +89,7 @@ py -3.14 extract_contacts.py --db employers.db --archive-dir site_archive
 
 Автоматическое определение категории компании (приоритетные, средние, исключённые).
 
-Обучение на выборке (50 компаний):
+Тест на выборке (50 компаний):
 
 ```bash
 py -3.14 categorize_companies.py --db employers.db --train --sample 50
@@ -276,15 +276,12 @@ py -3.14 site_mirror.py --db employers.db --base-dir site_archive --max-pages 12
 # 3. Извлечение контактов из архивов
 py -3.14 extract_contacts.py --db employers.db --archive-dir site_archive
 
-# 4. Категоризация компаний (обучение)
-py -3.14 categorize_companies.py --db employers.db --train --sample 1000
-
-# 5. Категоризация всех компаний
+# 4. Категоризация всех компаний
 py -3.14 categorize_companies.py --db employers.db --all
 
-# 6. Экспорт в Excel для ручного редактирования
+# 5. Экспорт в Excel для ручного редактирования
 py -3.14 employers_editor.py --db employers.db --export employers.xlsx
 
-# 7. Импорт комментариев после редактирования
+# 6. Импорт комментариев после редактирования
 py -3.14 employers_editor.py --db employers.db --import-file employers.xlsx
 ```
