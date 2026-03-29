@@ -81,7 +81,7 @@ py -3.14 site_mirror.py --db employers.db --base-dir site_archive --retry-errors
 Распаковка архивов, поиск email и телефонов, проверка телефонов через DaData, сохранение в базу.
 
 ```bash
-py -3.14 extract_contacts.py --db employers.db --archive-dir site_archive
+py -3.14 extract_contacts.py --db employers.db --archive-dir site_archive --exclude "Другое"
 ```
 ---
 
@@ -274,7 +274,7 @@ py -3.14 hh_to_sqlite.py -q "руководитель проектов АСУ Т
 py -3.14 site_mirror.py --db employers.db --base-dir site_archive --max-pages 12 --concurrency 6
 
 # 3. Извлечение контактов из архивов
-py -3.14 extract_contacts.py --db employers.db --archive-dir site_archive
+py -3.14 extract_contacts.py --db employers.db --archive-dir site_archive --exclude "Другое"
 
 # 4. Категоризация всех компаний
 py -3.14 categorize_companies.py --db employers.db --all
