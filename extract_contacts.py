@@ -6,20 +6,21 @@
 
 Что делает:
 1. Проверяет наличие полей email и phone в БД (добавляет если нет)
-2. Ищет компании, у которых нет email ИЛИ нет phone (phone = NULL или пустой, но не 'rejected')
-3. Для каждой компании определяет, что именно нужно искать
-4. Распаковывает архив сайта
-5. Ищет email и телефоны во всех HTML файлах
-6. Каждый найденный телефон проверяет через DaData
-7. Сохраняет в БД:
-   - email если нашли (или NULL если нет)
-   - телефон если валидный, 'rejected' если все телефоны невалидные, NULL при ошибке API
-8. Пишет подробный лог в консоль
+2. Ищет компании, у которых:
+   - email = NULL (не проверяли) - проверяем
+   - phone = NULL (не проверяли) - проверяем
+   (NOT_FOUND и REJECTED не проверяем повторно)
+3. Распаковывает архив сайта
+4. Ищет email и телефоны во всех HTML файлах
+5. Каждый найденный телефон проверяет через DaData
+6. Сохраняет в БД:
+   - email: найденный email или 'not_found'
+   - phone: валидный телефон, 'rejected' или 'not_found'
+   - NULL оставляем только при ошибке API
 
 Запуск:
     python extract_contacts.py --db employers.db --archive-dir site_archive
     python extract_contacts.py --db employers.db --archive-dir site_archive --exclude "Другое"
-    python extract_contacts.py --db employers.db --archive-dir site_archive --exclude "Другое" "Поставщики промышленного оборудования"
 
 Ключи DaData (получить на dadata.ru):
     DADATA_API_KEY = "ваш_ключ"
@@ -64,7 +65,8 @@ SEP = "; "
 EMAIL_REGEX = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
 PHONE_REGEX = re.compile(r'(?:(?:8|\+7)[\- ]?)?(?:\(?\d{3}\)?[\- ]?)?[\d\- ]{7,10}')
 
-# Специальное значение для rejected телефонов
+# Специальные значения для полей
+NOT_FOUND = "not_found"
 PHONE_REJECTED = "rejected"
 
 # Настройка логирования
@@ -114,7 +116,6 @@ class DaDataValidator:
         - is_api_error: True если ошибка API (нет денег, ключ не работает и т.д.)
         """
         if self.disabled:
-            # Если валидатор выключен вручную, считаем номер хорошим
             return True, None, False
         
         # Нормализуем номер для кэша
@@ -176,7 +177,7 @@ class ContactExtractor:
         self.exclude_categories = set(exclude_categories) if exclude_categories else set()
         self.validator = DaDataValidator()
         self.stats = defaultdict(int)
-        self.skipped_stats = defaultdict(int)  # Статистика по пропущенным компаниям
+        self.skipped_stats = defaultdict(int)
         self._init_database()
         
         if self.exclude_categories:
@@ -219,25 +220,25 @@ class ContactExtractor:
         if 'category' not in columns:
             print("⚠️  В базе нет поля category - фильтрация по категориям недоступна")
             print("   Запустите categorize_companies.py для категоризации компаний")
-            self.exclude_categories = set()  # Отключаем фильтрацию
+            self.exclude_categories = set()
         
         conn.commit()
         conn.close()
     
     def get_employers(self) -> List[Dict]:
         """
-        Получает компании для обработки и определяет, что именно нужно искать
+        Получает компании для обработки.
         
         Логика:
-        - Email: проверяем если NULL или пустой
-        - Телефон: проверяем если NULL или пустой (НЕ проверяем если 'rejected')
+        - Email: проверяем если NULL (не проверяли)
+        - Телефон: проверяем если NULL (не проверяли)
+        - not_found и rejected НЕ проверяем повторно
         """
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         
-        # Базовый запрос
-        # Для телефона: проверяем только если NULL или пустая строка (не 'rejected')
+        # Базовый запрос - проверяем только NULL поля
         query = """
             SELECT 
                 employer_id, 
@@ -249,12 +250,11 @@ class ContactExtractor:
             FROM employers
             WHERE archive_path IS NOT NULL AND archive_path != ''
             AND (
-                email IS NULL OR email = '' 
-                OR phone IS NULL OR phone = ''
+                email IS NULL OR phone IS NULL
             )
         """
         
-        # Добавляем фильтрацию по категориям, если нужно
+        # Добавляем фильтрацию по категориям
         params = []
         if self.exclude_categories:
             placeholders = ','.join(['?'] * len(self.exclude_categories))
@@ -271,21 +271,16 @@ class ContactExtractor:
         need_email_only = 0
         need_phone_only = 0
         need_both = 0
-        skipped_by_rejected = 0
         
         for row in rows:
             emp = dict(row)
             
-            # Определяем, что нужно искать
-            need_email = (emp.get('email') is None or emp.get('email') == '')
-            # Для телефона: проверяем только если NULL или пустой (НЕ 'rejected')
+            # Определяем, что нужно искать (только NULL поля)
+            email_value = emp.get('email')
             phone_value = emp.get('phone')
-            need_phone = (phone_value is None or phone_value == '')
             
-            # Если телефон = 'rejected' - пропускаем проверку телефона для этой компании
-            if phone_value == PHONE_REJECTED:
-                need_phone = False
-                skipped_by_rejected += 1
+            need_email = (email_value is None)  # не not_found, не строка с email
+            need_phone = (phone_value is None)  # не not_found, не rejected, не номер
             
             # Если оба поля не нужно проверять - пропускаем
             if not need_email and not need_phone:
@@ -313,15 +308,62 @@ class ContactExtractor:
                 logger.warning(f"Архив не найден: {archive_path}")
         
         # Выводим статистику
-        print(f"\n📊 Статистика по компаниям:")
-        print(f"   • Всего найдено для обработки: {len(employers)}")
+        print(f"\n📊 Статистика по компаниям для обработки:")
+        print(f"   • Всего: {len(employers)}")
         print(f"   • Нужен только email: {need_email_only}")
         print(f"   • Нужен только телефон: {need_phone_only}")
         print(f"   • Нужны оба: {need_both}")
-        if skipped_by_rejected > 0:
-            print(f"   • Пропущено (телефон = 'rejected'): {skipped_by_rejected}")
+        
+        # Статистика по уже обработанным (not_found/rejected)
+        self._print_already_processed_stats()
         
         return employers
+    
+    def _print_already_processed_stats(self):
+        """Выводит статистику по уже обработанным компаниям"""
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        
+        # Email статистика
+        cur.execute("""
+            SELECT COUNT(*) FROM employers 
+            WHERE email = ? AND archive_path IS NOT NULL
+        """, (NOT_FOUND,))
+        email_not_found = cur.fetchone()[0]
+        
+        cur.execute("""
+            SELECT COUNT(*) FROM employers 
+            WHERE email IS NOT NULL AND email != '' AND email != ? AND archive_path IS NOT NULL
+        """, (NOT_FOUND,))
+        email_found = cur.fetchone()[0]
+        
+        # Телефон статистика
+        cur.execute("""
+            SELECT COUNT(*) FROM employers 
+            WHERE phone = ? AND archive_path IS NOT NULL
+        """, (NOT_FOUND,))
+        phone_not_found = cur.fetchone()[0]
+        
+        cur.execute("""
+            SELECT COUNT(*) FROM employers 
+            WHERE phone = ? AND archive_path IS NOT NULL
+        """, (PHONE_REJECTED,))
+        phone_rejected = cur.fetchone()[0]
+        
+        cur.execute("""
+            SELECT COUNT(*) FROM employers 
+            WHERE phone IS NOT NULL AND phone != '' AND phone != ? AND phone != ? AND archive_path IS NOT NULL
+        """, (NOT_FOUND, PHONE_REJECTED))
+        phone_valid = cur.fetchone()[0]
+        
+        conn.close()
+        
+        print(f"\n📊 Уже обработано (не требуют повторной проверки):")
+        print(f"   • Email found: {email_found}")
+        print(f"   • Email not_found: {email_not_found}")
+        print(f"   • Phone valid: {phone_valid}")
+        print(f"   • Phone rejected: {phone_rejected}")
+        print(f"   • Phone not_found: {phone_not_found}")
     
     def extract_text_from_html(self, html_content: str) -> str:
         """Извлекает видимый текст из HTML"""
@@ -374,13 +416,17 @@ class ContactExtractor:
     def process_company(self, company: Dict) -> Tuple[Optional[str], Optional[str]]:
         """
         Обрабатывает одну компанию
-        Возвращает (email_str, phone_str)
+        Возвращает (email_value, phone_value)
         
-        Для телефона:
-        - Если найден валидный телефон -> возвращает номер
-        - Если все телефоны невалидные -> возвращает 'rejected'
-        - Если ошибка API -> возвращает None (оставляем NULL)
-        - Если телефоны не найдены -> возвращает None
+        email_value:
+        - найденный email (строка)
+        - NOT_FOUND если не найден
+        
+        phone_value:
+        - валидный телефон (строка)
+        - PHONE_REJECTED если все телефоны невалидные
+        - NOT_FOUND если телефоны не найдены
+        - None только при ошибке API (будет повтор)
         """
         archive_path = company['full_archive_path']
         name = company['employer_name']
@@ -389,7 +435,9 @@ class ContactExtractor:
         print(f"\n📁 {name}")
         print(f"   Категория: {category}")
         print(f"   Архив: {archive_path.name}")
-        print(f"   Нужно найти: {company['need_email'] and '📧' or ''} {company['need_phone'] and '📞' or ''}")
+        need_email = company['need_email']
+        need_phone = company['need_phone']
+        print(f"   Нужно найти: {need_email and '📧' or ''} {need_phone and '📞' or ''}")
         
         # Проверяем, нужно ли исключить эту компанию
         if category in self.exclude_categories:
@@ -413,7 +461,10 @@ class ContactExtractor:
                 
                 if not html_files:
                     print("   ⚠️  Нет HTML файлов")
-                    return None, None
+                    # Если нет HTML файлов, считаем что контакты не найдены
+                    final_email = NOT_FOUND if need_email else None
+                    final_phone = NOT_FOUND if need_phone else None
+                    return final_email, final_phone
                 
                 # Сортировка: сначала страницы с контактами
                 html_files.sort(key=lambda x: 0 if 'contact' in x.name.lower() or 'контакт' in x.name.lower() else 1)
@@ -433,21 +484,22 @@ class ContactExtractor:
                 
                 # ========== ОБРАБОТКА EMAIL ==========
                 final_email = None
-                if company['need_email']:
+                if need_email:
                     if all_emails:
                         print(f"   📧 Найдены email: {', '.join(all_emails)}")
                         final_email = SEP.join(sorted(all_emails))
                     else:
                         print("   📧 Email не найдены")
+                        final_email = NOT_FOUND
                 else:
                     if all_emails:
-                        print(f"   📧 Email уже есть в базе, найденные не сохраняем: {', '.join(all_emails)}")
+                        print(f"   📧 Email уже есть в базе (не NULL), найденные не сохраняем")
                 
                 # ========== ОБРАБОТКА ТЕЛЕФОНОВ ==========
                 final_phone = None
                 api_error_occurred = False
                 
-                if company['need_phone']:
+                if need_phone:
                     if all_phones:
                         print(f"   📞 Найдено кандидатов: {len(all_phones)}")
                         
@@ -458,8 +510,7 @@ class ContactExtractor:
                             is_valid, data, is_api_error = self.validator.is_valid(phone)
                             
                             if is_api_error:
-                                # Ошибка API - прерываем проверку, ничего не сохраняем
-                                print(f"      ⚠️ Ошибка API при проверке {phone} - проверка телефонов отложена")
+                                print(f"      ⚠️ Ошибка API при проверке {phone} - проверка отложена")
                                 api_error_occurred = True
                                 break
                             elif is_valid:
@@ -473,21 +524,23 @@ class ContactExtractor:
                                 print(f"      ❌ {phone} - ОТВЕРГНУТ")
                         
                         if api_error_occurred:
-                            # При ошибке API ничего не сохраняем, оставляем NULL
+                            # Ошибка API - ничего не сохраняем, оставляем NULL
                             final_phone = None
                             print(f"   ⚠️ Ошибка API DaData, проверка телефонов будет повторена при следующем запуске")
                         elif valid_phones:
-                            # Есть валидные телефоны
                             final_phone = SEP.join(sorted(valid_phones))
-                        elif rejected_count > 0 and not valid_phones:
-                            # Все найденные телефоны отвергнуты
+                        elif rejected_count > 0:
                             final_phone = PHONE_REJECTED
                             print(f"   📞 Все найденные телефоны отвергнуты, сохранен статус 'rejected'")
+                        else:
+                            # Не должно случиться, но на всякий случай
+                            final_phone = NOT_FOUND
                     else:
                         print("   📞 Телефоны не найдены")
+                        final_phone = NOT_FOUND
                 else:
                     if all_phones:
-                        print(f"   📞 Телефон уже есть в базе или rejected, найденные не сохраняем")
+                        print(f"   📞 Телефон уже есть в базе (не NULL), найденные не сохраняем")
                 
                 return final_email, final_phone
                 
@@ -533,30 +586,37 @@ class ContactExtractor:
     def print_stats(self):
         """Выводит итоговую статистику"""
         print("\n" + "="*60)
-        print("📊 ИТОГОВАЯ СТАТИСТИКА")
+        print("📊 ИТОГОВАЯ СТАТИСТИКА (текущий запуск)")
         print("="*60)
-        print(f"Всего обработано: {self.stats['total']}")
-        print(f"✅ Найдены контакты: {self.stats['found']}")
-        print(f"   • Email: {self.stats['email']}")
-        print(f"   • Телефон (валидный): {self.stats['phone_valid']}")
-        print(f"   • Телефон (rejected): {self.stats['phone_rejected']}")
-        print(f"   • И то и другое: {self.stats['both']}")
-        print(f"❌ Контакты не найдены: {self.stats['not_found']}")
-        print(f"⚠️  Ошибки (кроме API): {self.stats['errors']}")
-        print(f"🔄 Отложено (ошибка API): {self.stats['api_delayed']}")
+        print(f"Всего обработано в этом запуске: {self.stats['total']}")
+        
+        if self.stats['total'] > 0:
+            print(f"\n📧 Email:")
+            print(f"   • Найдено: {self.stats['email_found']}")
+            print(f"   • Не найдено (not_found): {self.stats['email_not_found']}")
+            
+            print(f"\n📞 Телефон:")
+            print(f"   • Валидных: {self.stats['phone_valid']}")
+            print(f"   • Отвергнуто (rejected): {self.stats['phone_rejected']}")
+            print(f"   • Не найдено (not_found): {self.stats['phone_not_found']}")
+            print(f"   • Отложено (ошибка API): {self.stats['phone_api_error']}")
+        
+        if self.stats['errors'] > 0:
+            print(f"\n⚠️  Других ошибок: {self.stats['errors']}")
         
         if self.skipped_stats:
             print(f"\n🚫 Исключено по категориям: {sum(self.skipped_stats.values())}")
             for category, count in sorted(self.skipped_stats.items(), key=lambda x: -x[1]):
                 print(f"   • {category}: {count}")
         
-        if not self.validator.disabled:
+        if not self.validator.disabled and self.validator.stats['checked'] > 0:
             print("\n📊 DaData статистика:")
-            print(f"   • Проверено: {self.validator.stats['checked']}")
+            print(f"   • Проверено телефонов: {self.validator.stats['checked']}")
             print(f"   • Валидных: {self.validator.stats['valid']}")
             print(f"   • Невалидных: {self.validator.stats['invalid']}")
             print(f"   • Ошибок API (лимиты, ключ): {self.validator.stats['api_errors']}")
             print(f"   • Других ошибок: {self.validator.stats['errors']}")
+        
         print("="*60)
     
     def run(self):
@@ -566,12 +626,12 @@ class ContactExtractor:
         employers = self.get_employers()
         
         if not employers:
-            logger.info("Нет компаний для обработки")
+            logger.info("Нет компаний для обработки (все контакты уже проверены)")
             return
         
-        print(f"\n📋 Найдено компаний для обработки: {len(employers)}")
+        print(f"\n📋 Компаний для обработки в этом запуске: {len(employers)}")
         if self.exclude_categories:
-            print(f"🚫 Из них будут исключены компании с категориями: {', '.join(self.exclude_categories)}")
+            print(f"🚫 Исключаемые категории: {', '.join(self.exclude_categories)}")
         print("="*60)
         
         # Обработка каждой компании
@@ -581,25 +641,24 @@ class ContactExtractor:
             try:
                 email, phone = self.process_company(company)
                 
-                # Статистика
-                if email is not None or phone is not None:
-                    self.stats['found'] += 1
+                # Статистика по email
                 if email is not None:
-                    self.stats['email'] += 1
+                    if email == NOT_FOUND:
+                        self.stats['email_not_found'] += 1
+                    else:
+                        self.stats['email_found'] += 1
+                
+                # Статистика по телефону
                 if phone is not None:
-                    if phone == PHONE_REJECTED:
+                    if phone == NOT_FOUND:
+                        self.stats['phone_not_found'] += 1
+                    elif phone == PHONE_REJECTED:
                         self.stats['phone_rejected'] += 1
                     else:
                         self.stats['phone_valid'] += 1
-                if email is not None and phone is not None and phone != PHONE_REJECTED:
-                    self.stats['both'] += 1
-                
-                if email is None and phone is None:
-                    self.stats['not_found'] += 1
-                
-                # Проверяем, была ли ошибка API (определяем по специальному флагу)
-                # Если phone = None и при этом были телефоны но API ошибся - считаем как отложено
-                # Это определяется внутри process_company, но для статистики добавим позже
+                elif phone is None and company['need_phone']:
+                    # None при ошибке API
+                    self.stats['phone_api_error'] += 1
                 
                 # Сохраняем в БД
                 self.save_to_db(company['employer_id'], email, phone)
