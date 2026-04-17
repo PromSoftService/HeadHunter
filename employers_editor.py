@@ -7,6 +7,7 @@
 Возможности:
 1. 📤 Экспорт данных в Excel (employer_id, employer_name, hh_url, site_url, added_at, category, email, phone, comments)
 2. 📥 Импорт комментариев из Excel обратно в базу
+2a. 🔀 Слияние отчёта по звонкам в Excel-дамп employers.xlsx
 3. 🧹 Очистка комментариев по ID в командной строке
 4. 🧹 Очистка всех комментариев
 5. 🗑️ Удаление компании из базы и связанного архива по ID
@@ -27,6 +28,10 @@
 
     # 📥 Импорт комментариев из Excel обратно в БД
     py -3.14 employers_editor.py --db employers.db --import-file employers.xlsx
+
+    # 🔀 Слияние отчёта по звонкам в Excel-дамп employers.xlsx
+    py -3.14 employers_editor.py --merge-comments-to-excel employers.xlsx --report-file "Отчет.xlsx"
+    py -3.14 employers_editor.py --merge-comments-to-excel employers.xlsx --report-file "Отчет.xlsx" --dry-run
 
     # 🧹 Очистка комментариев по ID
     py -3.14 employers_editor.py --db employers.db --clear-comment 245050
@@ -85,18 +90,25 @@ def ensure_columns(db_path: Path):
     """Проверяет наличие нужных колонок и добавляет при необходимости."""
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    
+
     cur.execute("PRAGMA table_info(employers)")
     columns = [col[1] for col in cur.fetchall()]
-    
-    # Комментарии
+
+    # Комментарии и статус
+    if 'status' not in columns:
+        try:
+            cur.execute("ALTER TABLE employers ADD COLUMN status TEXT")
+            print("✅ Добавлена колонка 'status'")
+        except sqlite3.OperationalError as e:
+            print(f"⚠️ Не удалось добавить колонку status: {e}")
+
     if 'comments' not in columns:
         try:
             cur.execute("ALTER TABLE employers ADD COLUMN comments TEXT")
             print("✅ Добавлена колонка 'comments'")
         except sqlite3.OperationalError as e:
             print(f"⚠️ Не удалось добавить колонку comments: {e}")
-    
+
     # Категории
     if 'category' not in columns:
         try:
@@ -104,28 +116,28 @@ def ensure_columns(db_path: Path):
             print("✅ Добавлена колонка 'category'")
         except sqlite3.OperationalError as e:
             print(f"⚠️ Не удалось добавить колонку category: {e}")
-    
+
     if 'category_priority' not in columns:
         try:
             cur.execute("ALTER TABLE employers ADD COLUMN category_priority TEXT")
             print("✅ Добавлена колонка 'category_priority'")
         except sqlite3.OperationalError as e:
             print(f"⚠️ Не удалось добавить колонку category_priority: {e}")
-    
+
     if 'category_updated' not in columns:
         try:
             cur.execute("ALTER TABLE employers ADD COLUMN category_updated TIMESTAMP")
             print("✅ Добавлена колонка 'category_updated'")
         except sqlite3.OperationalError as e:
             print(f"⚠️ Не удалось добавить колонку category_updated: {e}")
-    
+
     if 'category_notes' not in columns:
         try:
             cur.execute("ALTER TABLE employers ADD COLUMN category_notes TEXT")
             print("✅ Добавлена колонка 'category_notes'")
         except sqlite3.OperationalError as e:
             print(f"⚠️ Не удалось добавить колонку category_notes: {e}")
-    
+
     # Email и телефон
     if 'email' not in columns:
         try:
@@ -133,21 +145,21 @@ def ensure_columns(db_path: Path):
             print("✅ Добавлена колонка 'email'")
         except sqlite3.OperationalError as e:
             print(f"⚠️ Не удалось добавить колонку email: {e}")
-    
+
     if 'phone' not in columns:
         try:
             cur.execute("ALTER TABLE employers ADD COLUMN phone TEXT")
             print("✅ Добавлена колонка 'phone'")
         except sqlite3.OperationalError as e:
             print(f"⚠️ Не удалось добавить колонку phone: {e}")
-    
+
     if 'contacts_updated' not in columns:
         try:
             cur.execute("ALTER TABLE employers ADD COLUMN contacts_updated TIMESTAMP")
             print("✅ Добавлена колонка 'contacts_updated'")
         except sqlite3.OperationalError as e:
             print(f"⚠️ Не удалось добавить колонку contacts_updated: {e}")
-    
+
     conn.commit()
     conn.close()
 
@@ -1053,11 +1065,11 @@ def export_to_excel(db_path: Path, output_file: Path, limit: int = None):
     """Экспортирует данные в Excel с правильной последовательностью столбцов."""
     print(f"\n📤 Экспорт данных из {db_path} в {output_file}")
     print("=" * 60)
-    
+
     ensure_columns(db_path)
-    
+
     conn = sqlite3.connect(db_path)
-    
+
     # Формируем список колонок для экспорта в нужном порядке
     select_columns = [
         'employer_id',
@@ -1068,9 +1080,10 @@ def export_to_excel(db_path: Path, output_file: Path, limit: int = None):
         'category',
         'email',
         'phone',
+        'status',
         'comments'
     ]
-    
+
     query = f"""
         SELECT 
             {', '.join(select_columns)}
@@ -1079,29 +1092,30 @@ def export_to_excel(db_path: Path, output_file: Path, limit: int = None):
     """
     if limit:
         query += f" LIMIT {limit}"
-    
+
     df = pd.read_sql_query(query, conn)
-    
+
     print(f"  • employers: {len(df)} строк")
+    print(f"  • Со status: {df['status'].notna().sum()}")
     print(f"  • С комментариями: {df['comments'].notna().sum()}")
     print(f"  • С категориями: {df['category'].notna().sum()}")
     print(f"  • С email: {df['email'].notna().sum()}")
     print(f"  • С телефоном: {df['phone'].notna().sum()}")
-    
+
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name='employers', index=False)
-        
+
         # Добавляем лист с инструкцией
         instructions = pd.DataFrame({
             'Действие': [
-                'Редактирование комментариев',
+                'Редактирование status и comments',
                 'Импорт обратно в БД',
                 'Удаление компании',
                 'Очистка контактов',
                 'Очистка категорий'
             ],
             'Команда': [
-                'Заполните колонку "comments"',
+                'Заполните колонки "status" и/или "comments"',
                 f'py -3.14 employers_editor.py --db {db_path.name} --import-file {output_file.name}',
                 f'py -3.14 employers_editor.py --db {db_path.name} --delete <ID> --archive-dir site_archive',
                 f'py -3.14 employers_editor.py --db {db_path.name} --clear-contacts-id <ID>',
@@ -1109,89 +1123,398 @@ def export_to_excel(db_path: Path, output_file: Path, limit: int = None):
             ]
         })
         instructions.to_excel(writer, sheet_name='инструкция', index=False)
-    
+
     conn.close()
     print(f"\n✅ Экспорт завершён: {output_file}")
 
 
 def import_from_excel(db_path: Path, excel_file: Path, auto_confirm: bool = False):
-    """Импортирует комментарии из Excel файла обратно в базу данных (ТОЛЬКО ОБНОВЛЕНИЕ)."""
-    print(f"\n📥 Импорт комментариев из {excel_file} в {db_path}")
+    """Импортирует status и comments из Excel файла обратно в базу данных (ТОЛЬКО ОБНОВЛЕНИЕ)."""
+    print(f"\n📥 Импорт данных из {excel_file} в {db_path}")
     print("=" * 60)
-    
+
     if not excel_file.exists():
         print(f"❌ Файл {excel_file} не найден")
         return
-    
+
     ensure_columns(db_path)
-    
+
     try:
         df = pd.read_excel(excel_file, sheet_name='employers')
     except Exception as e:
         print(f"❌ Ошибка чтения Excel файла: {e}")
         return
-    
-    if 'comments' not in df.columns:
-        print("❌ В Excel файле нет колонки 'comments'")
-        return
-    
+
     if 'employer_id' not in df.columns:
         print("❌ В Excel файле нет колонки 'employer_id'")
         return
-    
-    # Предупреждение о том, что другие колонки не импортируются
-    other_columns = [col for col in df.columns if col not in ['employer_id', 'comments']]
-    if other_columns:
-        print("ℹ️  Следующие колонки будут проигнорированы (импортируются ТОЛЬКО комментарии):")
-        print(f"   {', '.join(other_columns[:5])}{'...' if len(other_columns) > 5 else ''}")
-    
-    comments_to_import = df['comments'].notna() & (df['comments'].astype(str).str.strip() != '')
-    total_to_import = comments_to_import.sum()
-    
-    if total_to_import == 0:
-        print("⚠️ В файле нет новых комментариев для импорта")
+
+    if 'comments' not in df.columns:
+        print("❌ В Excel файле нет колонки 'comments'")
         return
-    
-    print(f"📊 Найдено комментариев для импорта: {total_to_import}")
-    
+
+    if 'status' not in df.columns:
+        print("❌ В Excel файле нет колонки 'status'")
+        return
+
+    # Предупреждение о том, что другие колонки не импортируются
+    other_columns = [col for col in df.columns if col not in ['employer_id', 'status', 'comments']]
+    if other_columns:
+        print("ℹ️  Следующие колонки будут проигнорированы (импортируются ТОЛЬКО status и comments):")
+        print(f"   {', '.join(other_columns[:5])}{'...' if len(other_columns) > 5 else ''}")
+
+    def _is_filled(series: pd.Series) -> pd.Series:
+        return (
+            series.notna()
+            & (series.astype(str).str.strip() != '')
+            & (series.astype(str).str.strip().str.lower() != 'nan')
+            & (series.astype(str).str.strip().str.lower() != 'none')
+        )
+
+    comments_to_import = _is_filled(df['comments'])
+    status_to_import = _is_filled(df['status'])
+    rows_to_import = comments_to_import | status_to_import
+
+    total_rows_to_import = rows_to_import.sum()
+    total_comments_to_import = comments_to_import.sum()
+    total_status_to_import = status_to_import.sum()
+
+    if total_rows_to_import == 0:
+        print("⚠️ В файле нет новых status/comments для импорта")
+        return
+
+    print(f"📊 Найдено строк для импорта: {total_rows_to_import}")
+    print(f"   • Со status: {total_status_to_import}")
+    print(f"   • С comments: {total_comments_to_import}")
+
     if not auto_confirm:
-        response = input(f"\nОбновить комментарии для {total_to_import} компаний? (y/N): ")
+        response = input(f"\nОбновить status/comments для {total_rows_to_import} компаний? (y/N): ")
         if response.lower() != 'y':
             print("❌ Импорт отменён")
             return
-    
+
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    
-    updated = 0
+
+    updated_rows = 0
+    updated_status = 0
+    updated_comments = 0
     not_found = []
-    
-    for _, row in df[comments_to_import].iterrows():
-        comment = str(row['comments']).strip()
+
+    for _, row in df[rows_to_import].iterrows():
         employer_id = str(row['employer_id']).strip()
-        
-        # Обновляем ТОЛЬКО comments
-        cur.execute("""
-            UPDATE employers 
-            SET comments = ? 
+
+        status_value = None
+        comments_value = None
+        set_parts = []
+        params = []
+
+        if _is_filled(pd.Series([row['status']])).iloc[0]:
+            status_value = str(row['status']).strip()
+            set_parts.append('status = ?')
+            params.append(status_value)
+            updated_status += 1
+
+        if _is_filled(pd.Series([row['comments']])).iloc[0]:
+            comments_value = str(row['comments']).strip()
+            set_parts.append('comments = ?')
+            params.append(comments_value)
+            updated_comments += 1
+
+        if not set_parts:
+            continue
+
+        params.append(employer_id)
+
+        cur.execute(
+            f"""
+            UPDATE employers
+            SET {', '.join(set_parts)}
             WHERE employer_id = ?
-        """, (comment, employer_id))
-        
+            """,
+            params
+        )
+
         if cur.rowcount > 0:
-            updated += 1
+            updated_rows += 1
         else:
             not_found.append(employer_id)
-    
+
     conn.commit()
     conn.close()
-    
+
     print(f"\n✅ Импорт завершён:")
-    print(f"   • Обновлено комментариев: {updated}")
+    print(f"   • Обновлено строк: {updated_rows}")
+    print(f"   • Передано status: {updated_status}")
+    print(f"   • Передано comments: {updated_comments}")
     if not_found:
         print(f"   • Не найдено в БД: {len(not_found)}")
         if len(not_found) <= 5:
             for emp_id in not_found:
                 print(f"     - {emp_id}")
+
+
+def merge_comments_report_to_excel(
+    target_excel: Path,
+    report_excel: Path,
+    target_sheet: Optional[str] = None,
+    report_sheet: Optional[str] = None,
+    dry_run: bool = False,
+):
+    """
+    Вливает комментарии и status из отчёта по звонкам в employers.xlsx.
+
+    Маппинг:
+      - report.employer_id -> target.employer_id
+      - report.comments / report["Комментарий звонка"] -> target.comments
+      - report.status -> target.status
+
+    Логика comments:
+      - если comments пустой -> записываем комментарий из отчёта
+      - если comments уже равен новому -> пропускаем
+      - если comments заполнен и отличается -> дописываем через пустую строку
+
+    Логика status:
+      - если в дампе нет колонки status -> добавляем её перед comments
+      - если status из отчёта непустой -> перезаписываем target.status
+      - если status в отчёте пустой -> target.status не трогаем
+    """
+    print(f"\n🔀 Слияние отчёта {report_excel} в Excel-дамп {target_excel}")
+    print("=" * 60)
+    if dry_run:
+        print("🔍 РЕЖИМ ПРОСМОТРА (файл не изменяется)")
+
+    if not target_excel.exists():
+        print(f"❌ Файл дампа {target_excel} не найден")
+        return
+
+    if not report_excel.exists():
+        print(f"❌ Файл отчёта {report_excel} не найден")
+        return
+
+    if target_sheet is None:
+        try:
+            target_sheet = pd.ExcelFile(target_excel).sheet_names[0]
+            print(f"ℹ️ Используется первый лист дампа: {target_sheet}")
+        except Exception as e:
+            print(f"❌ Ошибка чтения структуры дампа Excel: {e}")
+            return
+
+    try:
+        target_df = pd.read_excel(target_excel, sheet_name=target_sheet)
+    except Exception as e:
+        print(f"❌ Ошибка чтения дампа Excel: {e}")
+        return
+
+    try:
+        if report_sheet:
+            report_df = pd.read_excel(report_excel, sheet_name=report_sheet)
+            actual_report_sheet = report_sheet
+        else:
+            report_book = pd.read_excel(report_excel, sheet_name=None)
+            if not report_book:
+                print("❌ В файле отчёта нет листов")
+                return
+            actual_report_sheet = next(iter(report_book.keys()))
+            report_df = report_book[actual_report_sheet]
+            print(f"ℹ️ Используется первый лист отчёта: {actual_report_sheet}")
+    except Exception as e:
+        print(f"❌ Ошибка чтения отчёта Excel: {e}")
+        return
+
+    required_target = {"employer_id"}
+    missing_target = required_target - set(target_df.columns)
+    if missing_target:
+        print(f"❌ В дампе отсутствуют колонки: {', '.join(sorted(missing_target))}")
+        return
+
+    if "employer_id" not in report_df.columns:
+        print("❌ В отчёте отсутствует колонка employer_id")
+        return
+
+    report_comment_column = None
+    for candidate in ("comments", "Комментарий звонка"):
+        if candidate in report_df.columns:
+            report_comment_column = candidate
+            break
+
+    if report_comment_column is None:
+        print("❌ В отчёте отсутствует колонка comments или 'Комментарий звонка'")
+        return
+
+    if "status" not in report_df.columns:
+        print("❌ В отчёте отсутствует колонка status")
+        return
+
+    if "comments" not in target_df.columns:
+        target_df["comments"] = pd.Series([pd.NA] * len(target_df), dtype="object")
+        print("ℹ️ В дамп добавлена колонка 'comments'")
+    else:
+        target_df["comments"] = target_df["comments"].astype("object")
+
+    if "status" not in target_df.columns:
+        comments_index = target_df.columns.get_loc("comments")
+        target_df.insert(comments_index, "status", pd.Series([pd.NA] * len(target_df), dtype="object"))
+        print("ℹ️ В дамп добавлена колонка 'status' перед 'comments'")
+    else:
+        target_df["status"] = target_df["status"].astype("object")
+
+    target_df["employer_id"] = target_df["employer_id"].astype("object")
+    report_df["employer_id"] = report_df["employer_id"].astype("object")
+
+    target_df["__merge_key__"] = (
+        target_df["employer_id"]
+        .astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .str.strip()
+    )
+    report_df["__merge_key__"] = (
+        report_df["employer_id"]
+        .astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .str.strip()
+    )
+
+    report_df["__report_comment__"] = (
+        report_df[report_comment_column]
+        .astype(str)
+        .str.strip()
+    )
+    report_df["__report_status__"] = (
+        report_df["status"]
+        .astype(str)
+        .str.strip()
+    )
+
+    report_df = report_df[
+        report_df["__merge_key__"].notna()
+        & (report_df["__merge_key__"] != "")
+        & (
+            (
+                report_df["__report_comment__"].notna()
+                & (report_df["__report_comment__"] != "")
+                & (report_df["__report_comment__"].str.lower() != "nan")
+                & (report_df["__report_comment__"].str.lower() != "none")
+            )
+            |
+            (
+                report_df["__report_status__"].notna()
+                & (report_df["__report_status__"] != "")
+                & (report_df["__report_status__"].str.lower() != "nan")
+                & (report_df["__report_status__"].str.lower() != "none")
+            )
+        )
+    ].copy()
+
+    if report_df.empty:
+        print("⚠️ В отчёте нет данных для слияния")
+        return
+
+    grouped = (
+        report_df.groupby("__merge_key__").agg({
+            "__report_comment__": lambda s: "\n\n".join(
+                dict.fromkeys(
+                    [
+                        str(x).strip()
+                        for x in s
+                        if str(x).strip()
+                        and str(x).strip().lower() not in ("nan", "none")
+                    ]
+                )
+            ),
+            "__report_status__": lambda s: next(
+                (
+                    str(x).strip()
+                    for x in reversed(list(s))
+                    if str(x).strip()
+                    and str(x).strip().lower() not in ("nan", "none")
+                ),
+                ""
+            ),
+        }).reset_index()
+    )
+
+    report_map = {
+        row["__merge_key__"]: {
+            "comment": row["__report_comment__"],
+            "status": row["__report_status__"],
+        }
+        for _, row in grouped.iterrows()
+    }
+
+    matched = 0
+    filled_empty = 0
+    appended = 0
+    unchanged = 0
+    status_updated = 0
+    not_found = []
+
+    for idx, row in target_df.iterrows():
+        key = row["__merge_key__"]
+        if key not in report_map:
+            continue
+
+        matched += 1
+        payload = report_map[key]
+
+        new_comment = str(payload["comment"]).strip()
+        new_status = str(payload["status"]).strip()
+
+        if new_status:
+            old_status_raw = row["status"]
+            old_status = "" if pd.isna(old_status_raw) else str(old_status_raw).strip()
+            if old_status != new_status:
+                target_df.at[idx, "status"] = new_status
+                status_updated += 1
+
+        if new_comment:
+            old_raw = row["comments"]
+            old_comment = "" if pd.isna(old_raw) else str(old_raw).strip()
+
+            if not old_comment:
+                target_df.at[idx, "comments"] = new_comment
+                filled_empty += 1
+            elif old_comment == new_comment:
+                unchanged += 1
+            elif new_comment in old_comment:
+                unchanged += 1
+            else:
+                target_df.at[idx, "comments"] = f"{old_comment}\n\n{new_comment}"
+                appended += 1
+
+    target_keys = set(target_df["__merge_key__"].tolist())
+    for key in report_map.keys():
+        if key not in target_keys:
+            not_found.append(key)
+
+    print(f"📊 Найдено ID в отчёте: {len(report_map)}")
+    print(f"📊 Совпало с дампом: {matched}")
+    print(f"   • Обновлено status: {status_updated}")
+    print(f"   • Заполнено пустых comments: {filled_empty}")
+    print(f"   • Дописано к существующим comments: {appended}")
+    print(f"   • Comments без изменений: {unchanged}")
+    print(f"   • Не найдено в дампе: {len(not_found)}")
+    if not_found and len(not_found) <= 20:
+        print("   " + ", ".join(sorted(not_found)))
+
+    if dry_run:
+        print("\n🔍 Режим просмотра. Для реального сохранения запустите без --dry-run")
+        return
+
+    target_df = target_df.drop(columns=["__merge_key__"], errors="ignore")
+
+    try:
+        all_sheets = pd.read_excel(target_excel, sheet_name=None)
+        all_sheets[target_sheet] = target_df
+
+        with pd.ExcelWriter(target_excel, engine="openpyxl") as writer:
+            for sheet_name, sheet_df in all_sheets.items():
+                sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        print(f"\n✅ Слияние завершено. Обновлён файл: {target_excel}")
+    except Exception as e:
+        print(f"❌ Ошибка сохранения Excel: {e}")
+        return
 
 
 def main():
@@ -1202,6 +1525,8 @@ def main():
                '  py -3.14 employers_editor.py --db employers.db --export employers.xlsx\n\n' +
                '  # 📥 Импорт комментариев из Excel\n' +
                '  py -3.14 employers_editor.py --db employers.db --import-file employers.xlsx\n\n' +
+               '  # 🔀 Слияние отчёта по звонкам в employers.xlsx\n' +
+               '  py -3.14 employers_editor.py --merge-comments-to-excel employers.xlsx --report-file "Отчет по звонкам.xlsx"\n\n' +
                '  # 🧹 Очистка комментариев по ID\n' +
                '  py -3.14 employers_editor.py --db employers.db --clear-comment 245050 245051\n\n' +
                '  # 🧹 Очистка всех комментариев\n' +
@@ -1221,108 +1546,125 @@ def main():
                '  # 🏷️ Очистка всех категорий\n' +
                '  py -3.14 employers_editor.py --db employers.db --clear-all-categories'
     )
-    
-    parser.add_argument('--db', default='employers.db', 
+
+    parser.add_argument('--db', default='employers.db',
                        help='Путь к SQLite базе (по умолчанию employers.db)')
-    
+
     # Режимы работы
-    parser.add_argument('--export', metavar='FILE', 
+    parser.add_argument('--export', metavar='FILE',
                        help='Экспорт в Excel файл')
     parser.add_argument('--import-file', dest='import_file', metavar='FILE',
                        help='Импорт комментариев из Excel файла')
-    
+    parser.add_argument('--merge-comments-to-excel', metavar='FILE',
+                       help='Влить комментарии из отчёта по звонкам в employers.xlsx')
+    parser.add_argument('--report-file', metavar='FILE',
+                       help='Excel-файл отчёта по звонкам для --merge-comments-to-excel')
+
     # Очистка комментариев
     parser.add_argument('--clear-comment', nargs='+', metavar='ID',
                        help='Очистить комментарии по списку ID')
     parser.add_argument('--clear-all-comments', action='store_true',
                        help='Очистить все комментарии')
-    
+
     # Удаление компании
     parser.add_argument('--delete', metavar='ID',
                        help='Удалить компанию по ID из базы и архива')
-    
+
     # Удаление архивов
     parser.add_argument('--clean-errors', action='store_true',
                        help='Удалить архивы сайтов с ошибками')
     parser.add_argument('--clean-ids', nargs='+', metavar='ID',
                        help='Удалить архивы по списку ID')
-    
+
     # Очистка контактов
     parser.add_argument('--clear-contacts-id', nargs='+', metavar='ID',
                        help='Очистить email и телефоны по списку ID')
     parser.add_argument('--clear-contacts', action='store_true',
                        help='Очистить все email и телефоны')
-    
+
     # Очистка категорий
     parser.add_argument('--clear-category', nargs='+', metavar='ID',
                        help='Очистить категории по списку ID')
     parser.add_argument('--clear-all-categories', action='store_true',
                        help='Очистить все категории')
-    
+
     # Дополнительные опции
     parser.add_argument('--only-empty', action='store_true',
                        help='При --clean-errors удалять только полностью не скачавшиеся сайты')
     parser.add_argument('--dry-run', action='store_true',
                        help='Показать, что будет сделано, но не выполнять')
-    parser.add_argument('--limit', type=int, 
+    parser.add_argument('--limit', type=int,
                        help='Ограничить количество строк при экспорте')
     parser.add_argument('--archive-dir', default='site_archive',
                        help='Директория с архивами сайтов')
-    
+
     args = parser.parse_args()
-    
+
+    archive_dir = Path(args.archive_dir) if args.archive_dir else None
+
+    # Проверяем, что указан хотя бы один режим
+    modes = [
+        args.export, args.import_file, args.merge_comments_to_excel, args.clear_comment, args.clear_all_comments,
+        args.delete, args.clean_errors, args.clean_ids, args.clear_contacts_id,
+        args.clear_contacts, args.clear_category, args.clear_all_categories
+    ]
+
+    if not any(modes):
+        parser.print_help()
+        return
+
+    # Excel-only режим: merge comments report -> employers.xlsx
+    if args.merge_comments_to_excel:
+        if not args.report_file:
+            print("❌ Для --merge-comments-to-excel нужно указать --report-file")
+            return
+
+        merge_comments_report_to_excel(
+            target_excel=Path(args.merge_comments_to_excel),
+            report_excel=Path(args.report_file),
+            dry_run=args.dry_run,
+        )
+        return
+
+    # Для остальных режимов нужна БД
     db_path = Path(args.db)
     if not db_path.exists():
         print(f"❌ Ошибка: файл базы {db_path} не найден.")
         return
-    
-    archive_dir = Path(args.archive_dir) if args.archive_dir else None
-    
-    # Проверяем, что указан хотя бы один режим
-    modes = [
-        args.export, args.import_file, args.clear_comment, args.clear_all_comments,
-        args.delete, args.clean_errors, args.clean_ids, args.clear_contacts_id,
-        args.clear_contacts, args.clear_category, args.clear_all_categories
-    ]
-    
-    if not any(modes):
-        parser.print_help()
-        return
-    
+
     # Экспорт
     if args.export:
         export_to_excel(db_path, Path(args.export), args.limit)
         return
-    
+
     # Импорт
     if args.import_file:
         import_from_excel(db_path, Path(args.import_file))
         return
-    
+
     # Очистка комментариев по ID
     if args.clear_comment:
         clear_comments_by_ids(db_path, args.clear_comment, args.dry_run)
         return
-    
+
     # Очистка всех комментариев
     if args.clear_all_comments:
         clear_all_comments(db_path, args.dry_run)
         return
-    
+
     # Удаление компании
     if args.delete:
         delete_company(db_path, args.delete, archive_dir)
         return
-    
+
     # Очистка архивов с ошибками
     if args.clean_errors:
         if not archive_dir:
             print("❌ Не указана директория с архивами (--archive-dir)")
             return
-        # Временно заглушка - потом добавим функцию
-        print("⏳ Функция в разработке")
+        clean_error_archives(db_path, archive_dir, args.only_empty, args.dry_run)
         return
-    
+
     # Очистка архивов по ID
     if args.clean_ids:
         if not archive_dir:
@@ -1330,22 +1672,22 @@ def main():
             return
         clean_archives_by_ids(db_path, archive_dir, args.clean_ids, args.dry_run)
         return
-    
+
     # Очистка контактов по ID
     if args.clear_contacts_id:
         clear_contacts_by_ids(db_path, args.clear_contacts_id, args.dry_run)
         return
-    
+
     # Очистка всех контактов
     if args.clear_contacts:
         clear_contacts(db_path, confirm=True, dry_run=args.dry_run)
         return
-    
+
     # Очистка категорий по ID
     if args.clear_category:
         clear_category_by_ids(db_path, args.clear_category, args.dry_run)
         return
-    
+
     # Очистка всех категорий
     if args.clear_all_categories:
         clear_all_categories(db_path, args.dry_run)

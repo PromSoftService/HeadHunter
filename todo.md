@@ -171,6 +171,11 @@ py -3.14 employers_editor.py --db employers.db --export employers.xlsx
 py -3.14 employers_editor.py --db employers.db --export employers.xlsx --limit 100
 ```
 
+## Влить комменты из отчета в employers.xlsx
+```bash
+py -3.14 employers_editor.py --merge-comments-to-excel employers.xlsx --report-file "Отчет.xlsx"
+```
+
 ## 6.2. Импорт комментариев из Excel
 
 Импортирует только колонку comments из Excel файла обратно в базу.
@@ -282,6 +287,9 @@ py -3.14 categorize_companies.py --db employers.db --all
 # 5. Экспорт в Excel для ручного редактирования
 py -3.14 employers_editor.py --db employers.db --export employers.xlsx
 
-# 6. Импорт комментариев после редактирования
+# 6. Влить комменты из отчета в employers.xlsx
+py -3.14 employers_editor.py --merge-comments-to-excel employers.xlsx --report-file "Отчет.xlsx"
+
+# 7. Импорт комментариев после редактирования
 py -3.14 employers_editor.py --db employers.db --import-file employers.xlsx
 ```
