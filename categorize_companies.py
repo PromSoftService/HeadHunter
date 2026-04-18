@@ -3,15 +3,7 @@
 
 """
 Скрипт для категоризации компаний из базы данных через DeepSeek API.
-Версия 5.0 - двухэтапная категоризация с приоритетом групп.
-
-Логика работы:
-1. Сначала категоризация по company_info из hh.ru
-2. Если категория из ГРУППЫ_1 (высокий приоритет) - сразу сохраняем
-3. Если категория из ГРУППЫ_2 или "Другое" - анализируем архив сайта
-4. Если архив дает категорию из ГРУППЫ_1 - берем её
-5. Если архив дает категорию из ГРУППЫ_2 - берем её (уточнили)
-6. Если и архив не дал категории - оставляем "Другое"
+Версия 6.0 - единый запрос с company_info и архивом сайта, детальный промпт.
 """
 
 import sqlite3
@@ -30,40 +22,28 @@ import os
 import sys
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
-from collections import defaultdict
 
-# Загружаем переменные из .env
 load_dotenv()
 
-# 🔑 API КЛЮЧ DEEPSEEK из .env
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 if not DEEPSEEK_API_KEY:
     print("❌ ОШИБКА: DEEPSEEK_API_KEY не найден в .env")
-    print("   Получите ключ на platform.deepseek.com и добавьте в файл .env")
-    print("   Пример: DEEPSEEK_API_KEY=sk-ваш_ключ\n")
     sys.exit(1)
 
-# Конфигурация API
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 MODEL = "deepseek-chat"
 
 # ============================================================
-# 🎯 КАТЕГОРИИ (разделены на группы приоритета)
+# 🎯 ЕДИНЫЙ СПИСОК КАТЕГОРИЙ (16 штук)
 # ============================================================
-
-# ГРУППА 1: Высокий приоритет - целевые компании (сразу принимаем)
-GROUP_1_CATEGORIES = [
+CATEGORIES = [
     "Производители котельного оборудования",
     "Поставщики котельного оборудования",
     "Монтаж/строительство котельных",
     "Интеграторы АСУТП",
     "Разработчики промышленного ПО",
     "Проектные институты (автоматизация)",
-    "Крупные промышленные корпорации"
-]
-
-# ГРУППА 2: Средний приоритет - потенциальные заказчики (требуют проверки архивом)
-GROUP_2_CATEGORIES = [
+    "Крупные промышленные корпорации",
     "Поставщики промышленного оборудования",
     "Машиностроительные заводы",
     "Энергетические компании",
@@ -71,118 +51,162 @@ GROUP_2_CATEGORIES = [
     "Пищевые производства",
     "Металлургические комбинаты",
     "Нефтегазовые компании (не киты)",
-    "Строительно-монтажные организации"
+    "Строительно-монтажные организации",
+    "Другое"
 ]
 
-# Все категории (для API и совместимости)
-CATEGORIES = GROUP_1_CATEGORIES + GROUP_2_CATEGORIES + ["Другое"]
-
-# Множества для быстрой проверки
-GROUP_1_SET = set(GROUP_1_CATEGORIES)
-GROUP_2_SET = set(GROUP_2_CATEGORIES)
-
 # ============================================================
-# 📝 ПРОМПТЫ ДЛЯ DEEPSEEK
+# 📝 ДЕТАЛЬНЫЙ ПРОМПТ (один для всех случаев)
 # ============================================================
 
-SYSTEM_MESSAGE = "Ты эксперт по классификации промышленных компаний. Отвечай только в формате JSON. Строго выбирай категорию из предложенного списка."
+SYSTEM_MESSAGE = "Ты эксперт по классификации промышленных компаний. Отвечай только в формате JSON."
 
-PROMPT_COMPANY_INFO = """Ты эксперт по классификации промышленных компаний для поиска заказчиков программистов АСУТП.
+DETAILED_PROMPT = """Ты эксперт по классификации промышленных компаний для поиска заказчиков программистов АСУТП.
 
-Информация о компании:
-Название: {company_name}
-Описание: {company_info}
+Ниже приведена информация о компании:
+- Название: {company_name}
+- Описание из базы вакансий (hh.ru):
+{company_info}
 
-Выбери ОДНУ категорию из списка.
+{archive_section}
 
-Список категорий:
+Твоя задача — выбрать ОДНУ категорию из строго фиксированного списка.
+
+Разрешённые категории (только из этого списка):
 {categories}
 
-Правила:
-- Интеграторы АСУТП = сами разрабатывают и внедряют системы автоматизации, SCADA, ПЛК
-- Производители котельного оборудования = производят котлы, котельные установки
-- Поставщики котельного оборудования = продают котлы (не производят)
-- Монтаж/строительство котельных = строят, монтируют, обслуживают котельные
-- Поставщики промышленного оборудования = продают КИПиА, контроллеры, насосы (не внедряют)
-- Проектные институты = только проектируют, ищут подрядчиков
-- Крупные промышленные корпорации = Газпром, Росатом, РУСАЛ, Норникель, Северсталь и т.п.
-- Машиностроительные заводы = производят оборудование, есть автоматизация
-- Энергетические компании = ТЭЦ, ГРЭС, электросети
-- Химические производства = нефтехимия, удобрения, кислоты
-- Пищевые производства = пищевая промышленность
-- Металлургические комбинаты = чёрная и цветная металлургия
-- Нефтегазовые компании (не киты) = добыча и переработка (кроме крупнейших корпораций)
-- Строительно-монтажные организации = монтируют, налаживают оборудование
+---
 
-Если компания НЕ ПОДХОДИТ ни под одну категорию из списка, верни "Другое".
+## ПРИНЦИПЫ КАТЕГОРИЗАЦИИ
+
+1. **Сначала определи, ложится ли компания в эту промышленную таксономию.**
+   - Если нет — ставь "Другое".
+   - Не нужно насильно притягивать компанию в промышленную категорию.
+
+2. **Если ложится, определи роль компании:**
+   - производитель оборудования
+   - поставщик / дистрибьютор
+   - монтаж / строительство / подряд
+   - интегратор / инжиниринг
+   - разработчик ПО
+   - отраслевой производственный заказчик / промышленное предприятие
+   - крупная промышленная группа / холдинг
+
+3. **После этого выбери конкретную категорию из списка.**
+
+---
+
+## ОСОБЫЙ ПРИОРИТЕТ (проверяй внимательно)
+Эти 4 категории важны, но записывай компанию туда только при наличии явных признаков:
+- Производители котельного оборудования
+- Поставщики котельного оборудования
+- Монтаж/строительство котельных
+- Интеграторы АСУТП
+
+---
+
+## СИЛЬНЫЕ ПРИЗНАКИ ДЛЯ КАТЕГОРИЙ
+
+### Производители котельного оборудования
+- собственное производство котлов, горелок, водогрейных/паровых котлов
+- блочно-модульные котельные, котельные установки
+- теплоэнергетическое оборудование, горелочные устройства
+
+### Поставщики котельного оборудования
+- поставка котлов, горелок, котельного оборудования
+- продажа промышленных котлов, теплообменников
+- дилер котельного оборудования
+
+### Монтаж/строительство котельных
+- строительство, монтаж, реконструкция котельных
+- пусконаладка котельных, тепловые пункты (ИТП/ЦТП)
+
+### Интеграторы АСУТП
+- АСУ ТП, SCADA, ПЛК, КИПиА, шкафы автоматики
+- диспетчеризация технологических процессов
+- промышленная автоматизация как основной профиль
+- автоматизация котельных, насосных, производств
+
+### Разработчики промышленного ПО
+- собственная промышленная платформа, SCADA/MES
+- лицензируемое промышленное ПО (не только внедрение)
+
+### Проектные институты (автоматизация)
+- проектирование систем автоматизации, АСУ ТП, КИПиА
+
+### Поставщики промышленного оборудования
+- поставка насосов, КИП, резервуаров, компрессоров и т.п.
+- не попадает в более узкую котельную категорию
+
+### Машиностроительные заводы
+- производство машин, станков, тяжёлого оборудования
+- заводской профиль
+
+### Отраслевые категории (энергетика, химия, пищевая, металлургия, нефтегаз)
+- компания сама является производственным предприятием отрасли
+- не путать с поставщиком оборудования для отрасли
+
+### Крупные промышленные корпорации
+- крупный холдинг (Газпром, Росатом, РУСАЛ, Норникель, Северсталь...)
+- более узкая категория не описывает сущность лучше
+
+### Строительно-монтажные организации
+- общестроительные, подрядные, EPC-работы
+- если нет явного котельного профиля
+
+---
+
+## ЗАПРЕТЫ (типовые ошибки)
+
+1. Производитель/поставщик оборудования для отрасли ≠ сама отрасль.
+   Пример: поставщик для нефтегаза ≠ нефтегазовая компания.
+2. Производитель упаковки ≠ пищевое производство.
+3. Производитель холодильников/насосов/телематики/медтехники ≠ производитель котельного оборудования без прямых признаков.
+4. Сервисный центр по котлам ≠ строительство котельных.
+5. Наличие слов "энерго", "тепло", "пром", "автоматизация" в названии само по себе ничего не доказывает.
+6. ИТ-интегратор (ERP, CRM, документооборот) ≠ интегратор АСУТП без промышленной автоматизации.
+7. Любая автоматизация ≠ АСУТП.
+8. Если компания не ложится в список — ставь "Другое", не насилуй.
+
+---
+
+## ПРАВИЛА ВЫБОРА МЕЖДУ ПОХОЖИМИ КАТЕГОРИЯМИ
+
+- Внедряет, проектирует, собирает АСУТП → Интеграторы АСУТП.
+- Продаёт или производит оборудование → Поставщики промышленного оборудования (или узкая котельная).
+- Собственный промышленный ПО → Разработчики промышленного ПО.
+- Строит, монтирует, подряд → Строительно-монтажные организации (если не котельная).
+- Если одновременно делает многое — выбери наиболее узкий профиль по доминанте.
+- Если уверенность невысокая — всё равно выбери наиболее вероятную категорию, не занижай до "Другое" без причины.
+
+---
 
 Верни ТОЛЬКО JSON в формате:
 {{"category": "название категории"}}
 """
 
-PROMPT_ARCHIVE = """Ты эксперт по классификации промышленных компаний для поиска заказчиков программистов АСУТП.
-
-Название компании: {company_name}
-
-Текст с сайта (первые {text_length} символов):
-{text}
-
-Выбери ОДНУ категорию из списка.
-
-Список категорий:
-{categories}
-
-Правила:
-- Интеграторы АСУТП = сами разрабатывают и внедряют системы автоматизации, SCADA, ПЛК
-- Производители котельного оборудования = производят котлы, котельные установки
-- Поставщики котельного оборудования = продают котлы (не производят)
-- Монтаж/строительство котельных = строят, монтируют, обслуживают котельные
-- Поставщики промышленного оборудования = продают КИПиА, контроллеры, насосы (не внедряют)
-- Проектные институты = только проектируют, ищут подрядчиков
-- Крупные промышленные корпорации = Газпром, Росатом, РУСАЛ, Норникель, Северсталь и т.п.
-- Машиностроительные заводы = производят оборудование, есть автоматизация
-- Энергетические компании = ТЭЦ, ГРЭС, электросети
-- Химические производства = нефтехимия, удобрения, кислоты
-- Пищевые производства = пищевая промышленность
-- Металлургические комбинаты = чёрная и цветная металлургия
-- Нефтегазовые компании (не киты) = добыча и переработка (кроме крупнейших корпораций)
-- Строительно-монтажные организации = монтируют, налаживают оборудование
-
-Если компания НЕ ПОДХОДИТ ни под одну категорию из списка, верни "Другое".
-
-Верни ТОЛЬКО JSON в формате:
-{{"category": "название категории"}}
-"""
-
-
-def get_category_group(category: str) -> int:
-    """
-    Возвращает номер группы приоритета категории:
-    1 - высший приоритет (целевые компании)
-    2 - средний приоритет (потенциальные заказчики)
-    0 - исключено (Другое)
-    """
-    if category in GROUP_1_SET:
-        return 1
-    elif category in GROUP_2_SET:
-        return 2
+def build_prompt(company_name: str, company_info: str, archive_text: Optional[str] = None) -> str:
+    """Формирует промпт с учётом наличия архива."""
+    categories_str = "\n".join(f"  • {cat}" for cat in CATEGORIES)
+    
+    if archive_text:
+        archive_section = f"Текст с сайта компании (из архива, первые 20000 символов):\n{archive_text}"
     else:
-        return 0
+        archive_section = "Архив сайта отсутствует."
+    
+    return DETAILED_PROMPT.format(
+        company_name=company_name,
+        company_info=company_info,
+        archive_section=archive_section,
+        categories=categories_str
+    )
 
-
-def get_priority_level(category: str) -> str:
-    """Возвращает строковое обозначение приоритета для БД"""
-    group = get_category_group(category)
-    if group == 1:
-        return "primary"
-    elif group == 2:
-        return "medium"
-    else:
-        return "excluded"
-
+# ============================================================
+# 🔧 ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
 
 def init_database(db_path: Path):
-    """Добавляет поля для категорий, если их нет"""
+    """Добавляет поля для категорий, если их нет (сохраняем старые поля, но не используем активно)."""
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     
@@ -191,35 +215,20 @@ def init_database(db_path: Path):
     
     if 'category' not in columns:
         cur.execute("ALTER TABLE employers ADD COLUMN category TEXT")
-        print("✅ Добавлено поле category")
-    
-    if 'category_priority' not in columns:
-        cur.execute("ALTER TABLE employers ADD COLUMN category_priority TEXT")
-        print("✅ Добавлено поле category_priority")
-    
     if 'category_updated' not in columns:
         cur.execute("ALTER TABLE employers ADD COLUMN category_updated TIMESTAMP")
-        print("✅ Добавлено поле category_updated")
-    
     if 'category_notes' not in columns:
         cur.execute("ALTER TABLE employers ADD COLUMN category_notes TEXT")
-        print("✅ Добавлено поле category_notes")
-    
-    # Новые поля для отслеживания источника категоризации
-    if 'category_source' not in columns:
-        cur.execute("ALTER TABLE employers ADD COLUMN category_source TEXT")
-        print("✅ Добавлено поле category_source (company_info/archive)")
-    
-    if 'original_category' not in columns:
-        cur.execute("ALTER TABLE employers ADD COLUMN original_category TEXT")
-        print("✅ Добавлено поле original_category (категория из company_info)")
+    # Оставляем старые поля для совместимости, но не используем
+    for col in ['category_priority', 'category_source', 'original_category']:
+        if col not in columns:
+            cur.execute(f"ALTER TABLE employers ADD COLUMN {col} TEXT")
     
     conn.commit()
     conn.close()
 
-
 def extract_text_from_html(html_content: str) -> str:
-    """Извлекает видимый текст из HTML"""
+    """Извлекает видимый текст из HTML."""
     try:
         soup = BeautifulSoup(html_content, 'html.parser')
         for script in soup(["script", "style"]):
@@ -231,85 +240,72 @@ def extract_text_from_html(html_content: str) -> str:
     except:
         return ""
 
-
-def extract_text_from_archive(archive_path: Path, max_chars: int = 3000) -> str:
+def extract_text_from_archive(archive_path: Path, max_chars: int = 20000) -> str:
     """
     Распаковывает архив и извлекает текст из HTML файлов.
-    Равномерно распределяет max_chars между страницами.
+    Равномерно распределяет max_chars между страницами, приоритет: index, contact, about, остальные.
     """
+    if not archive_path.exists():
+        return ""
+    
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
-        
         try:
             with tarfile.open(archive_path, 'r:gz') as tar:
                 tar.extractall(path=temp_path)
-            
-            # Находим все HTML файлы
-            html_files = list(temp_path.rglob('*.html')) + list(temp_path.rglob('*.htm'))
-            
-            if not html_files:
-                return ""
-            
-            # Сортируем по важности: index, contact, about, остальные
-            def priority(filepath):
-                name = filepath.name.lower()
-                if name in ['index.html', 'index.htm', 'default.html', 'default.htm']:
-                    return 0
-                elif 'contact' in name or 'kontakt' in name or 'контакт' in name:
-                    return 1
-                elif 'about' in name or 'company' in name or 'о компании' in name:
-                    return 2
-                else:
-                    return 3
-            
-            html_files.sort(key=priority)
-            
-            # Сначала извлекаем текст со всех страниц, чтобы знать их длину
-            page_texts = []
-            for html_file in html_files:
-                try:
-                    content = html_file.read_text(encoding='utf-8', errors='ignore')
-                    text = extract_text_from_html(content)
-                    text = ' '.join(text.split())  # Нормализуем пробелы
-                    if text:
-                        page_texts.append(text)
-                except:
-                    continue
-            
-            if not page_texts:
-                return ""
-            
-            # Равномерно распределяем max_chars между страницами
-            remaining = max_chars
-            n_pages = len(page_texts)
-            result_parts = []
-            
-            for i, text in enumerate(page_texts):
-                if remaining <= 0:
-                    break
-                
-                # Бюджет для текущей страницы
-                budget = remaining // (n_pages - i)
-                # Берём текст, но не больше бюджета
-                chunk = text[:budget]
-                result_parts.append(chunk)
-                remaining -= len(chunk)
-            
-            return "\n\n".join(result_parts)
-                
-        except Exception as e:
+        except Exception:
             return ""
-
+        
+        html_files = list(temp_path.rglob('*.html')) + list(temp_path.rglob('*.htm'))
+        if not html_files:
+            return ""
+        
+        def priority(filepath):
+            name = filepath.name.lower()
+            if name in ['index.html', 'index.htm', 'default.html', 'default.htm']:
+                return 0
+            elif 'contact' in name or 'kontakt' in name or 'контакт' in name:
+                return 1
+            elif 'about' in name or 'company' in name or 'о компании' in name:
+                return 2
+            else:
+                return 3
+        
+        html_files.sort(key=priority)
+        
+        page_texts = []
+        for html_file in html_files:
+            try:
+                content = html_file.read_text(encoding='utf-8', errors='ignore')
+                text = extract_text_from_html(content)
+                text = ' '.join(text.split())
+                if text:
+                    page_texts.append(text)
+            except:
+                continue
+        
+        if not page_texts:
+            return ""
+        
+        remaining = max_chars
+        n_pages = len(page_texts)
+        result_parts = []
+        for i, text in enumerate(page_texts):
+            if remaining <= 0:
+                break
+            budget = remaining // (n_pages - i) if n_pages - i > 0 else remaining
+            chunk = text[:budget]
+            result_parts.append(chunk)
+            remaining -= len(chunk)
+        
+        return "\n\n".join(result_parts)
 
 def call_deepseek(prompt: str) -> Tuple[Optional[str], str]:
-    """
-    Отправляет промпт в DeepSeek и возвращает (категория, notes)
-    """
+    """Отправляет промпт в DeepSeek, возвращает (категория, notes)."""
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
     }
-    
     payload = {
         "model": MODEL,
         "messages": [
@@ -317,195 +313,48 @@ def call_deepseek(prompt: str) -> Tuple[Optional[str], str]:
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.2,
-        "max_tokens": 100
+        "max_tokens": 200  # достаточно для названия категории
     }
-    
     try:
-        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=30)
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=60)
         response.raise_for_status()
-        
         result = response.json()
         content = result['choices'][0]['message']['content'].strip()
-        
-        # Парсим JSON
         json_match = re.search(r'\{.*\}', content, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group())
             category = data.get('category', '').strip()
-            
             if category in CATEGORIES:
                 return category, ""
             else:
-                return "Другое", f"API вернул неизвестную категорию: {category}"
+                return "Другое", f"Неизвестная категория: {category}"
         else:
             return "Другое", f"Не удалось распарсить JSON: {content[:100]}"
-            
     except Exception as e:
         return None, f"Ошибка API: {e}"
 
-
-def categorize_by_info(company_name: str, company_info: str) -> Tuple[Optional[str], str]:
+def categorize_company(company: Dict) -> Tuple[Optional[str], str]:
     """
-    Категоризация по company_info
-    """
-    # Ограничиваем описание
-    if len(company_info) > 2000:
-        company_info = company_info[:2000]
-    
-    categories_str = "\n".join([f"  • {cat}" for cat in CATEGORIES])
-    
-    prompt = PROMPT_COMPANY_INFO.format(
-        company_name=company_name,
-        company_info=company_info,
-        categories=categories_str
-    )
-    return call_deepseek(prompt)
-
-
-def categorize_by_archive(archive_path: Path, company_name: str) -> Tuple[Optional[str], str]:
-    """
-    Категоризация по содержимому архива сайта
-    """
-    print(f"   📦 Анализ архива: {archive_path.name}")
-    
-    text = extract_text_from_archive(archive_path, max_chars=3000)
-    if not text:
-        return "Другое", "Архив пуст или не содержит текста"
-    
-    categories_str = "\n".join([f"  • {cat}" for cat in CATEGORIES])
-    
-    prompt = PROMPT_ARCHIVE.format(
-        company_name=company_name,
-        text=text,
-        text_length=len(text),
-        categories=categories_str
-    )
-    return call_deepseek(prompt)
-
-
-def categorize_company(company: Dict) -> Tuple[Optional[str], str, str, Optional[str]]:
-    """
-    Двухэтапная категоризация с приоритетом групп:
-    
-    Логика:
-    1. Сначала категоризация по company_info
-    2. Если категория из ГРУППЫ_1 → принимаем сразу
-    3. Если категория из ГРУППЫ_2 или "Другое" → идем к архиву
-    4. Если архив дает категорию из ГРУППЫ_1 → берем её
-    5. Если архив дает категорию из ГРУППЫ_2 → берем её
-    6. Если и архив не дал категории → оставляем "Другое"
-    
-    Возвращает (category, notes, source, original_category)
+    Единая категоризация: объединяет company_info (до 8000 символов)
+    и текст из архива (до 20000 символов) в один промпт.
     """
     name = company['employer_name']
-    info = company['company_info']
+    info = company.get('company_info', '')
+    if info and len(info) > 8000:
+        info = info[:8000]
+    
+    archive_text = ""
     archive_path = company.get('full_archive_path')
-    has_archive = archive_path and archive_path.exists()
+    if archive_path and archive_path.exists():
+        archive_text = extract_text_from_archive(archive_path, max_chars=20000)
     
-    # ЭТАП 1: Категоризация по company_info
-    print(f"\n📁 {name}")
-    print(f"   🔍 Этап 1: анализ company_info...")
-    
-    info_category, info_notes = categorize_by_info(name, info)
-    original_category = info_category if info_category else "Другое"
-    
-    if not info_category:
-        info_category = "Другое"
-    
-    info_group = get_category_group(info_category)
-    
-    # Если категория из ГРУППЫ_1 - сразу принимаем
-    if info_group == 1:
-        print(f"   ✅ Категория из ГРУППЫ_1: {info_category}")
-        print(f"   📌 Принята без анализа архива")
-        return info_category, info_notes, "company_info", original_category
-    
-    # Если категория из ГРУППЫ_2 или "Другое" - нужен архив
-    print(f"   ⏸️  Категория из ГРУППЫ_{info_group if info_group > 0 else '0 (Другое)'}: {info_category}")
-    print(f"   🔍 Этап 2: анализ архива сайта...")
-    
-    # Проверяем наличие архива
-    if not has_archive:
-        print(f"   ⚠️  Архив не найден, оставляем категорию из company_info")
-        if info_group == 2:
-            print(f"   📌 Принята категория из ГРУППЫ_2: {info_category}")
-            return info_category, info_notes, "company_info", original_category
-        else:
-            print(f"   ❌ Категория не определена (Другое)")
-            return "Другое", "Не удалось определить категорию", "none", original_category
-    
-    # ЭТАП 2: Категоризация по архиву
-    archive_category, archive_notes = categorize_by_archive(archive_path, name)
-    
-    if not archive_category:
-        archive_category = "Другое"
-    
-    archive_group = get_category_group(archive_category)
-    
-    # Если архив дал категорию из ГРУППЫ_1 - берем её
-    if archive_group == 1:
-        print(f"   ✅ Архив дал категорию из ГРУППЫ_1: {archive_category}")
-        print(f"   📌 Принята категория из архива (уточнение)")
-        return archive_category, f"Уточнено по архиву (было: {info_category})", "archive", original_category
-    
-    # Если архив дал категорию из ГРУППЫ_2 - берем её
-    elif archive_group == 2:
-        print(f"   ✅ Архив дал категорию из ГРУППЫ_2: {archive_category}")
-        print(f"   📌 Принята категория из архива")
-        return archive_category, f"Определено по архиву (company_info: {info_category})", "archive", original_category
-    
-    # Если архив не дал категории
-    else:
-        # Если исходная категория была из ГРУППЫ_2 - берем её
-        if info_group == 2:
-            print(f"   ⚠️  Архив не дал категории, возвращаемся к company_info: {info_category}")
-            return info_category, info_notes, "company_info", original_category
-        else:
-            print(f"   ❌ Категория не определена (Другое)")
-            return "Другое", "Не удалось определить категорию", "none", original_category
+    prompt = build_prompt(name, info, archive_text if archive_text else None)
+    return call_deepseek(prompt)
 
-
-def get_companies_for_training(db_path: Path, sample_size: int = 50) -> List[Dict]:
-    """
-    Получает случайную выборку компаний для обучения
-    """
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    
-    cur.execute("""
-        SELECT employer_id, employer_name, company_info, archive_path
-        FROM employers
-        WHERE company_info IS NOT NULL AND company_info != ''
-        ORDER BY RANDOM()
-        LIMIT ?
-    """, (sample_size,))
-    
-    rows = cur.fetchall()
-    conn.close()
-    
-    companies = []
-    for row in rows:
-        emp = dict(row)
-        # Проверяем существование архива
-        if emp.get('archive_path'):
-            archive_path = Path(emp['archive_path'])
-            if not archive_path.is_absolute():
-                archive_path = Path('site_archive') / archive_path.name
-            if archive_path.exists():
-                emp['full_archive_path'] = archive_path
-        companies.append(emp)
-    
-    return companies
-
-
-def get_companies_to_categorize(db_path: Path, limit: Optional[int] = None, 
-                               all_companies: bool = False,
-                               company_id: Optional[str] = None,
-                               priority_only: bool = False) -> List[Dict]:
-    """
-    Получает компании для категоризации
-    """
+def get_companies_to_categorize(db_path: Path, limit: Optional[int] = None,
+                                all_companies: bool = False,
+                                company_id: Optional[str] = None) -> List[Dict]:
+    """Получает компании для категоризации (только без категории)."""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -513,8 +362,7 @@ def get_companies_to_categorize(db_path: Path, limit: Optional[int] = None,
     if company_id:
         cur.execute("""
             SELECT employer_id, employer_name, company_info, archive_path
-            FROM employers
-            WHERE employer_id = ?
+            FROM employers WHERE employer_id = ?
         """, (company_id,))
     elif all_companies:
         cur.execute("""
@@ -524,27 +372,14 @@ def get_companies_to_categorize(db_path: Path, limit: Optional[int] = None,
             ORDER BY employer_name
         """)
     else:
-        limit = limit or 10
-        base_query = """
+        cur.execute("""
             SELECT employer_id, employer_name, company_info, archive_path
             FROM employers
             WHERE company_info IS NOT NULL AND company_info != ''
-            AND (category IS NULL OR category = '')
-        """
-        
-        if priority_only:
-            # Исключаем заведомо ненужных по ключевым словам в названии
-            exclude_patterns = [
-                'газпром', 'роснефть', 'лукойл', 'северсталь', 'нлмк', 'ммк',
-                'росатом', 'транснефть', 'сургутнефтегаз', 'татнефть',
-                'hh.ru', 'headhunter', 'superjob', 'кадровое', 'рекрутинг',
-                'школа', 'колледж', 'институт', 'университет'
-            ]
-            for pattern in exclude_patterns:
-                base_query += f" AND employer_name NOT LIKE '%{pattern}%'"
-        
-        base_query += " ORDER BY employer_name LIMIT ?"
-        cur.execute(base_query, (limit,))
+              AND (category IS NULL OR category = '')
+            ORDER BY employer_name
+            LIMIT ?
+        """, (limit or 10,))
     
     rows = cur.fetchall()
     conn.close()
@@ -552,7 +387,6 @@ def get_companies_to_categorize(db_path: Path, limit: Optional[int] = None,
     companies = []
     for row in rows:
         emp = dict(row)
-        # Проверяем существование архива
         if emp.get('archive_path'):
             archive_path = Path(emp['archive_path'])
             if not archive_path.is_absolute():
@@ -560,160 +394,36 @@ def get_companies_to_categorize(db_path: Path, limit: Optional[int] = None,
             if archive_path.exists():
                 emp['full_archive_path'] = archive_path
         companies.append(emp)
-    
     return companies
 
-
-def save_category(db_path: Path, employer_id: str, category: str, 
-                  notes: str = "", source: str = "", 
-                  original_category: Optional[str] = None):
-    """Сохраняет категорию в базу данных"""
+def save_category(db_path: Path, employer_id: str, category: str, notes: str = ""):
+    """Сохраняет категорию в базу."""
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    
     now = datetime.now().isoformat()
-    priority = get_priority_level(category)
-    
     cur.execute("""
         UPDATE employers
-        SET category = ?, 
-            category_priority = ?, 
-            category_updated = ?, 
-            category_notes = ?,
-            category_source = ?,
-            original_category = ?
+        SET category = ?, category_updated = ?, category_notes = ?
         WHERE employer_id = ?
-    """, (category, priority, now, notes, source, original_category, employer_id))
-    
+    """, (category, now, notes, employer_id))
     conn.commit()
     conn.close()
 
-
-def train_on_sample(db_path: Path, sample_size: int, archive_dir: Path):
-    """
-    Режим обучения на случайной выборке
-    """
-    print(f"\n🎓 РЕЖИМ ОБУЧЕНИЯ (выборка: {sample_size} компаний)")
-    print("=" * 60)
-    
-    companies = get_companies_for_training(db_path, sample_size)
-    
-    if not companies:
-        print("❌ Нет компаний с информацией для обучения")
-        return
-    
-    print(f"\n📊 Найдено компаний: {len(companies)}")
-    
-    results = []
-    stats = {
-        'total': len(companies),
-        'primary': 0,
-        'medium': 0,
-        'excluded': 0,
-        'by_archive': 0,
-        'by_info': 0,
-        'failed': 0,
-        'by_category': {}
-    }
-    
-    for i, company in enumerate(tqdm(companies, desc="Обучение", unit="комп"), 1):
-        emp_id = company['employer_id']
-        name = company['employer_name']
-        
-        print(f"\n[{i}/{len(companies)}] 🔍 Обработка: {name}")
-        print(f"   ID: {emp_id}")
-        
-        category, notes, source, original_category = categorize_company(company)
-        
-        if category:
-            priority = get_priority_level(category)
-            stats[priority] += 1
-            stats['by_category'][category] = stats['by_category'].get(category, 0) + 1
-            
-            if source == 'archive':
-                stats['by_archive'] += 1
-            elif source == 'company_info':
-                stats['by_info'] += 1
-            
-            save_category(db_path, emp_id, category, notes, source, original_category)
-            
-            results.append({
-                'id': emp_id,
-                'name': name,
-                'category': category,
-                'priority': priority,
-                'source': source,
-                'original_category': original_category,
-                'notes': notes
-            })
-            
-            priority_symbol = {
-                "primary": "🔥",
-                "medium": "🟡",
-                "excluded": "🔴"
-            }.get(priority, "❓")
-            
-            source_mark = " 📦 (по архиву)" if source == 'archive' else " 📝 (по company_info)" if source == 'company_info' else ""
-            print(f"   {priority_symbol} {category}{source_mark}")
-            if original_category and original_category != category:
-                print(f"   📌 Исходная категория: {original_category}")
-        else:
-            stats['failed'] += 1
-            print(f"   ❌ Ошибка")
-    
-    # Сохраняем результаты
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = f"training_results_{timestamp}.json"
-    
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump({
-            'timestamp': timestamp,
-            'sample_size': sample_size,
-            'stats': stats,
-            'results': results
-        }, f, ensure_ascii=False, indent=2)
-    
-    print("\n" + "=" * 60)
-    print("📊 РЕЗУЛЬТАТЫ ОБУЧЕНИЯ")
-    print("=" * 60)
-    print(f"Всего обработано: {stats['total']}")
-    print(f"🔥 Приоритетных (Группа 1): {stats['primary']}")
-    print(f"🟡 Средний потенциал (Группа 2): {stats['medium']}")
-    print(f"🔴 Исключено: {stats['excluded']}")
-    print(f"📦 Определено по архиву: {stats['by_archive']}")
-    print(f"📝 Определено по company_info: {stats['by_info']}")
-    print(f"❌ Ошибок: {stats['failed']}")
-    
-    print("\n📊 РАСПРЕДЕЛЕНИЕ ПО КАТЕГОРИЯМ:")
-    for category, count in sorted(stats['by_category'].items(), key=lambda x: -x[1]):
-        group = get_category_group(category)
-        if group == 1:
-            symbol = "🔥"
-        elif group == 2:
-            symbol = "🟡"
-        else:
-            symbol = "🔴"
-        print(f"   {symbol} {category}: {count}")
-    
-    print(f"\n✅ Результаты сохранены в: {output_file}")
-    print("=" * 60)
-
+# ============================================================
+# 📊 ОСНОВНОЙ ЦИКЛ И СТАТИСТИКА
+# ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Категоризация компаний через DeepSeek API (версия 5.0)')
+    parser = argparse.ArgumentParser(description='Категоризация компаний через DeepSeek (единый промпт, версия 6.0)')
     parser.add_argument('--db', required=True, help='Путь к SQLite базе')
     parser.add_argument('--archive-dir', default='site_archive', help='Папка с архивами сайтов')
     
     group = parser.add_mutually_exclusive_group()
-    group.add_argument('--train', action='store_true', help='Режим обучения (случайная выборка)')
-    group.add_argument('--limit', type=int, help='Количество компаний для категоризации')
-    group.add_argument('--all', action='store_true', help='Категоризировать ВСЕ компании')
+    group.add_argument('--limit', type=int, help='Количество компаний для категоризации (без категории)')
+    group.add_argument('--all', action='store_true', help='Категоризировать ВСЕ компании (без категории)')
     group.add_argument('--id', dest='company_id', help='Категоризировать конкретную компанию')
-    group.add_argument('--priority', action='store_true', 
-                      help='Только приоритетные категории (исключить заведомо ненужных)')
     
-    parser.add_argument('--sample', type=int, default=50, 
-                       help='Размер выборки для обучения (по умолчанию 50)')
+    parser.add_argument('--sample', type=int, default=50, help='Размер выборки для обучения (не используется в этой версии, оставлен для совместимости)')
     
     args = parser.parse_args()
     
@@ -722,127 +432,79 @@ def main():
         print(f"❌ База не найдена: {db_path}")
         return
     
-    archive_dir = Path(args.archive_dir)
-    
     init_database(db_path)
     
-    # Режим обучения
-    if args.train:
-        train_on_sample(db_path, args.sample, archive_dir)
+    # Определяем режим
+    if args.limit:
+        mode = "limit"
+        limit = args.limit
+    elif args.all:
+        mode = "all"
+        limit = None
+    elif args.company_id:
+        mode = "id"
+        limit = None
+    else:
+        # по умолчанию 10
+        mode = "limit"
+        limit = 10
+    
+    companies = get_companies_to_categorize(
+        db_path,
+        limit=limit if mode != "all" else None,
+        all_companies=(mode == "all"),
+        company_id=args.company_id
+    )
+    
+    if not companies:
+        print("✅ Нет компаний для категоризации")
         return
     
-    # Режим категоризации
-    if args.limit or args.all or args.company_id or args.priority:
-        if args.priority:
-            mode = "priority"
-            limit = args.limit or 10
-        elif args.limit:
-            mode = "limit"
-            limit = args.limit
-        elif args.all:
-            mode = "all"
-            limit = None
-        elif args.company_id:
-            mode = "id"
-            limit = None
-        else:
-            mode = "default"
-            limit = 10
-        
-        companies = get_companies_to_categorize(
-            db_path, 
-            limit=limit if mode != "all" else None,
-            all_companies=(mode == "all"),
-            company_id=args.company_id,
-            priority_only=(mode == "priority")
-        )
-        
-        if not companies:
-            print("✅ Нет компаний для категоризации")
-            return
-        
-        print(f"\n{'='*60}")
-        if mode == "id":
-            print(f"🔍 Обработка компании с ID: {args.company_id}")
-        elif mode == "all":
-            print(f"📊 Обработка ВСЕХ компаний: {len(companies)} шт")
-        elif mode == "priority":
-            print(f"🔥 Обработка {limit} приоритетных компаний")
-        else:
-            print(f"📊 Обработка {limit} компаний")
-        print('='*60)
-        
-        stats = {
-            'total': len(companies),
-            'primary': 0,
-            'medium': 0,
-            'excluded': 0,
-            'by_archive': 0,
-            'by_info': 0,
-            'failed': 0,
-            'by_category': {}
-        }
-        
-        for company in tqdm(companies, desc="Категоризация", unit="комп"):
-            emp_id = company['employer_id']
-            name = company['employer_name']
-            
-            category, notes, source, original_category = categorize_company(company)
-            
-            if category:
-                priority = get_priority_level(category)
-                stats[priority] += 1
-                stats['by_category'][category] = stats['by_category'].get(category, 0) + 1
-                
-                if source == 'archive':
-                    stats['by_archive'] += 1
-                elif source == 'company_info':
-                    stats['by_info'] += 1
-                
-                save_category(db_path, emp_id, category, notes, source, original_category)
-                
-                priority_symbol = {
-                    "primary": "🔥",
-                    "medium": "🟡",
-                    "excluded": "🔴"
-                }.get(priority, "❓")
-                
-                source_mark = " 📦 (по архиву)" if source == 'archive' else " 📝 (по company_info)" if source == 'company_info' else ""
-                print(f"\n📁 {name}")
-                print(f"   {priority_symbol} {category}{source_mark}")
-                if original_category and original_category != category:
-                    print(f"   📌 Исходная категория: {original_category}")
-            else:
-                stats['failed'] += 1
-                print(f"\n📁 {name}")
-                print(f"   ❌ Ошибка")
-        
-        print("\n" + "="*60)
-        print("📊 ИТОГОВАЯ СТАТИСТИКА")
-        print("="*60)
-        print(f"Всего обработано: {stats['total']}")
-        print(f"🔥 Группа 1 (высокий приоритет): {stats['primary']}")
-        print(f"🟡 Группа 2 (средний приоритет): {stats['medium']}")
-        print(f"🔴 Исключено: {stats['excluded']}")
-        print(f"📦 Определено по архиву: {stats['by_archive']}")
-        print(f"📝 Определено по company_info: {stats['by_info']}")
-        print(f"❌ Ошибок: {stats['failed']}")
-        
-        print("\n📊 РАСПРЕДЕЛЕНИЕ ПО КАТЕГОРИЯМ:")
-        for category, count in sorted(stats['by_category'].items(), key=lambda x: -x[1]):
-            group = get_category_group(category)
-            if group == 1:
-                symbol = "🔥"
-            elif group == 2:
-                symbol = "🟡"
-            else:
-                symbol = "🔴"
-            print(f"   {symbol} {category}: {count}")
-        print("="*60)
-    
+    print(f"\n{'='*60}")
+    if mode == "id":
+        print(f"🔍 Обработка компании с ID: {args.company_id}")
+    elif mode == "all":
+        print(f"📊 Обработка ВСЕХ компаний: {len(companies)} шт")
     else:
-        parser.print_help()
-
+        print(f"📊 Обработка {limit} компаний")
+    print('='*60)
+    
+    stats = {
+        'total': len(companies),
+        'categorized': 0,
+        'failed': 0,
+        'by_category': {}
+    }
+    
+    for company in tqdm(companies, desc="Категоризация", unit="комп"):
+        emp_id = company['employer_id']
+        name = company['employer_name']
+        
+        category, notes = categorize_company(company)
+        
+        if category:
+            save_category(db_path, emp_id, category, notes)
+            stats['categorized'] += 1
+            stats['by_category'][category] = stats['by_category'].get(category, 0) + 1
+            print(f"\n📁 {name}")
+            print(f"   ✅ {category}")
+            if notes:
+                print(f"   📝 {notes[:100]}")
+        else:
+            stats['failed'] += 1
+            print(f"\n📁 {name}")
+            print(f"   ❌ Ошибка: {notes}")
+    
+    print("\n" + "="*60)
+    print("📊 ИТОГОВАЯ СТАТИСТИКА")
+    print("="*60)
+    print(f"Всего обработано: {stats['total']}")
+    print(f"✅ Успешно: {stats['categorized']}")
+    print(f"❌ Ошибок: {stats['failed']}")
+    print("\n📊 РАСПРЕДЕЛЕНИЕ ПО КАТЕГОРИЯМ:")
+    for cat, cnt in sorted(stats['by_category'].items(), key=lambda x: -x[1]):
+        print(f"   • {cat}: {cnt}")
+    print("="*60)
 
 if __name__ == "__main__":
     main()
